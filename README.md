@@ -6,30 +6,7 @@ Copilot gives you Claude and GPT models through your existing subscription, but 
 
 Sign in to GitHub, watch what you've spent, pick a model, and point either agent at Copilot — without leaving the desktop or editing a config file by hand.
 
-```
-┌─ Copilot Proxy ──────────── :4141 ─┐
-│ voidsteed                    [ ● ] │
-│                                    │
-│ PREMIUM REQUESTS      resets in 2d │
-│ ██░░░░░░░░░░░░░░░░░░           10% │
-│ 966k of 10M credits · enterprise   │
-│                                    │
-│ CHAT                     unlimited │
-│ COMPLETIONS              unlimited │
-│                                    │
-│ LAST 7 DAYS         1.7k requests  │
-│ ▁▃▇▅▂▆█                            │
-│ S M T W T F S                      │
-│                                    │
-│ USE WITH                           │
-│ ▸ Claude Code                [ ● ] │
-│   claude-opus-5                    │
-│ ▸ Codex CLI                  [ ● ] │
-│   gpt-5.6-sol                      │
-│                                    │
-│ [ Restart ]  [ Logs ]  [ Usage ]   │
-└────────────────────────────────────┘
-```
+![The Copilot Proxy panel: quota meters, a seven-day request chart, and toggles for Claude Code and Codex CLI](preview.png)
 
 ## What it does
 
