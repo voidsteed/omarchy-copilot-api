@@ -1,6 +1,10 @@
 # Copilot Proxy for Omarchy
 
-Run [`copilot-proxy-api`](https://github.com/voidsteed/copilot-proxy-api) from your Omarchy bar: start and stop the proxy, sign in to GitHub, watch your Copilot premium-request quota, and point Claude Code or Codex CLI at it — without leaving the desktop.
+**Use your GitHub Copilot subscription in Claude Code and Codex CLI.**
+
+Copilot gives you Claude and GPT models through your existing subscription, but only inside an editor. [`copilot-proxy-api`](https://github.com/voidsteed/copilot-proxy-api) exposes them as an Anthropic- and OpenAI-compatible API so your terminal agents can use them too — this plugin puts that whole setup in your Omarchy bar.
+
+Sign in to GitHub, watch what you've spent, pick a model, and point either agent at Copilot — without leaving the desktop or editing a config file by hand.
 
 ```
 ┌─ Copilot Proxy ──────────── :4141 ─┐
@@ -29,7 +33,7 @@ Run [`copilot-proxy-api`](https://github.com/voidsteed/copilot-proxy-api) from y
 
 ## What it does
 
-The proxy bridges your GitHub Copilot subscription to Claude Code (Anthropic Messages API) and Codex CLI (OpenAI Responses API). This plugin is the desktop half of that: one bar icon and one panel covering the whole lifecycle.
+One bar icon and one panel covering the whole lifecycle — the proxy, the login, the quota, and both clients.
 
 - **Service control** — installs a `systemd --user` unit and starts/stops/restarts it from a switch in the panel. The proxy survives shell restarts and comes back after a crash.
 - **In-panel GitHub sign-in** — shows the device code with Copy and Open-GitHub buttons, then polls until you approve. No terminal round-trip.

@@ -5,14 +5,14 @@
   "version": "1.0.0",
   "author": "Yujun Liu",
   "license": "MIT",
-  "description": "Start and monitor copilot-proxy-api from the bar: GitHub sign-in, Copilot quota meters, and one-click wiring for Claude Code or Codex CLI.",
+  "description": "Use your GitHub Copilot subscription in Claude Code and Codex CLI. Sign in, watch your quota, and switch either agent to Copilot from the bar.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Copilot Proxy",
-    "description": "Run the GitHub Copilot bridge, watch premium-request quota, and point Claude Code or Codex at it.",
+    "description": "Run Claude Code and Codex CLI on your GitHub Copilot subscription, with quota meters and model pickers in the bar.",
     "category": "AI",
     "aliases": ["copilot", "copilot-proxy"],
     "allowMultiple": false,
