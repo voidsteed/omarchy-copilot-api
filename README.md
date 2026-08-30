@@ -2,7 +2,30 @@
 
 Run [`copilot-proxy-api`](https://github.com/voidsteed/copilot-proxy-api) from your Omarchy bar: start and stop the proxy, sign in to GitHub, watch your Copilot premium-request quota, and point Claude Code or Codex CLI at it — without leaving the desktop.
 
-![Copilot Proxy panel](preview.png)
+```
+┌─ Copilot Proxy ──────────── :4141 ─┐
+│ voidsteed                    [ ● ] │
+│                                    │
+│ PREMIUM REQUESTS      resets in 2d │
+│ ██░░░░░░░░░░░░░░░░░░           10% │
+│ 966k of 10M credits · enterprise   │
+│                                    │
+│ CHAT                     unlimited │
+│ COMPLETIONS              unlimited │
+│                                    │
+│ LAST 7 DAYS         1.7k requests  │
+│ ▁▃▇▅▂▆█                            │
+│ S M T W T F S                      │
+│                                    │
+│ USE WITH                           │
+│ ▸ Claude Code                [ ● ] │
+│   claude-opus-5                    │
+│ ▸ Codex CLI                  [ ● ] │
+│   gpt-5.6-sol                      │
+│                                    │
+│ [ Restart ]  [ Logs ]  [ Usage ]   │
+└────────────────────────────────────┘
+```
 
 ## What it does
 
@@ -27,7 +50,7 @@ The plugin needs a `copilot-proxy-api` build that has the `/status` endpoint (ad
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/voidsteed/omarchy-copilot-proxy.git --enable
+omarchy plugin add https://github.com/voidsteed/omarchy-copilot-api.git --enable
 ```
 
 Then open the panel from the bar and click **Install service**.
