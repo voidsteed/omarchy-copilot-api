@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "id": "voidsteed.copilot-proxy",
+  "name": "Copilot Proxy",
+  "version": "1.0.0",
+  "author": "Yujun Liu",
+  "license": "MIT",
+  "description": "Start and monitor copilot-proxy-api from the bar: GitHub sign-in, Copilot quota meters, and one-click wiring for Claude Code or Codex CLI.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Copilot Proxy",
+    "description": "Run the GitHub Copilot bridge, watch premium-request quota, and point Claude Code or Codex at it.",
+    "category": "AI",
+    "aliases": ["copilot", "copilot-proxy"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "port": 4141,
+      "service": "copilot-proxy-api",
+      "refreshIntervalSec": 300,
+      "claudeModel": "claude-opus-5",
+      "claudeSmallModel": "claude-sonnet-5",
+      "claudeEffort": "default",
+      "claudeUltracode": false,
+      "codexModel": "gpt-5.5",
+      "codexReasoningEffort": "high",
+      "hideWhenStopped": false
+    },
+    "schema": [
+      {
+        "key": "port",
+        "type": "integer",
+        "label": "Proxy port",
+        "min": 1024,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 4141,
+        "description": "Port the proxy listens on. Must match the systemd unit."
+      },
+      {
+        "key": "service",
+        "type": "string",
+        "label": "Systemd user unit",
+        "defaultValue": "copilot-proxy-api",
+        "description": "Name of the --user unit the widget starts and stops."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Quota refresh (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "claudeModel",
+        "type": "string",
+        "label": "Claude Code model",
+        "defaultValue": "claude-opus-5",
+        "description": "Written to ANTHROPIC_MODEL. Also selectable from the panel."
+      },
+      {
+        "key": "claudeSmallModel",
+        "type": "string",
+        "label": "Claude Code small/fast model",
+        "defaultValue": "claude-sonnet-5",
+        "description": "Written to ANTHROPIC_SMALL_FAST_MODEL. Also selectable from the panel."
+      },
+      {
+        "key": "claudeEffort",
+        "type": "enum",
+        "label": "Claude Code effort",
+        "defaultValue": "default",
+        "options": [
+          { "value": "default", "label": "Default (unset)" },
+          { "value": "low", "label": "Low" },
+          { "value": "medium", "label": "Medium" },
+          { "value": "high", "label": "High" },
+          { "value": "xhigh", "label": "Extra high" },
+          { "value": "max", "label": "Max" }
+        ],
+        "description": "Written as `effort` in ~/.claude/settings.json. Default leaves the key out."
+      },
+      {
+        "key": "claudeUltracode",
+        "type": "boolean",
+        "label": "Claude Code ultracode",
+        "defaultValue": false,
+        "description": "Written as `ultracode` in ~/.claude/settings.json. Orchestrates tasks with multi-agent workflows."
+      },
+      {
+        "key": "codexModel",
+        "type": "string",
+        "label": "Codex model",
+        "defaultValue": "gpt-5.5",
+        "description": "Written as `model` in ~/.codex/config.toml. Also selectable from the panel."
+      },
+      {
+        "key": "codexReasoningEffort",
+        "type": "enum",
+        "label": "Codex reasoning effort",
+        "defaultValue": "high",
+        "options": [
+          { "value": "minimal", "label": "Minimal" },
+          { "value": "low", "label": "Low" },
+          { "value": "medium", "label": "Medium" },
+          { "value": "high", "label": "High" },
+          { "value": "xhigh", "label": "Extra high" },
+          { "value": "max", "label": "Max" },
+          { "value": "ultra", "label": "Ultra" }
+        ],
+        "description": "Written as `model_reasoning_effort`. Also selectable from the panel."
+      },
+      {
+        "key": "hideWhenStopped",
+        "type": "boolean",
+        "label": "Hide the icon while the proxy is stopped",
+        "defaultValue": false,
+        "description": "Keeps the bar clean on machines where you rarely run the proxy."
+      }
+    ]
+  }
+}

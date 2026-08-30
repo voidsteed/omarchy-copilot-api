@@ -1,0 +1,615 @@
+#!/bin/bash
+
+# Side-effect half of the Copilot Proxy plugin: everything that touches
+# systemd, ~/.claude/settings.json, or ~/.codex/config.toml happens here, so
+# the QML panel only ever renders state and shells out to one command.
+#
+# Kept runnable on its own — every action prints something a human can read,
+# and `status` speaks JSON so the panel has one thing to parse.
+
+set -uo pipefail
+
+PORT="${COPILOT_PROXY_PORT:-4141}"
+SERVICE="${COPILOT_PROXY_SERVICE:-copilot-proxy-api}"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CODEX_CONFIG="$HOME/.codex/config.toml"
+UNIT_DIR="$HOME/.config/systemd/user"
+
+die() {
+  echo "omarchy-copilot-proxy: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-copilot-proxy <command> [options]
+
+Commands:
+  status              Print proxy + client wiring state as JSON
+  install-unit        Write and enable the systemd --user unit
+  start | stop | restart
+                      Control the proxy service
+  logs                Follow the proxy journal
+  auth                Start a GitHub device login (blocking, for a terminal)
+  use-claude          Point Claude Code at the proxy
+  use-codex           Point Codex CLI at the proxy
+  unset-claude        Remove the proxy env block from Claude Code settings
+  unset-codex         Remove the proxy provider from Codex config
+  dashboard           Open the usage dashboard in a browser
+
+Options:
+  --port <n>          Proxy port (default 4141, or $COPILOT_PROXY_PORT)
+  --service <name>    Systemd unit name (default copilot-proxy-api)
+  --model <id>        Model for use-claude / use-codex
+  --small-model <id>  Small/fast model for use-claude
+  --effort <low|medium|high|xhigh|max>
+                      Claude Code effort level (omit to leave it unset)
+  --ultracode         Enable Claude Code ultracode mode
+  --no-ultracode      Disable it again
+  --reasoning-effort <minimal|low|medium|high|xhigh|max|ultra>
+                      Reasoning effort for use-codex (default high)
+USAGE
+}
+
+# ---------------------------------------------------------------- arguments
+
+command_name="${1:-}"
+[[ -n $command_name ]] || { usage; exit 1; }
+shift || true
+
+model=""
+small_model=""
+reasoning_effort=""
+claude_effort=""
+ultracode=""
+while (($#)); do
+  case "$1" in
+    --port) PORT="${2:?--port needs a value}"; shift 2 ;;
+    --service) SERVICE="${2:?--service needs a value}"; shift 2 ;;
+    --model) model="${2:?--model needs a value}"; shift 2 ;;
+    --small-model) small_model="${2:?--small-model needs a value}"; shift 2 ;;
+    --reasoning-effort) reasoning_effort="${2:?--reasoning-effort needs a value}"; shift 2 ;;
+    --effort) claude_effort="${2:?--effort needs a value}"; shift 2 ;;
+    --ultracode) ultracode=true; shift ;;
+    --no-ultracode) ultracode=false; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unexpected argument: $1" ;;
+  esac
+done
+
+BASE_URL="http://localhost:$PORT"
+
+# How to run the proxy, in order of how specific the answer is: an explicit
+# override, a global install, then a source checkout. The checkout is last
+# because it needs a runtime to launch it, and finding one is a search of its
+# own — but it is the difference between "works" and "not on PATH" on a
+# machine where the proxy is being developed rather than consumed.
+#
+# Prints a full command line, so callers must not quote the result as one word.
+resolve_proxy_command() {
+  if [[ -n ${COPILOT_PROXY_COMMAND:-} ]]; then
+    echo "$COPILOT_PROXY_COMMAND"
+    return
+  fi
+
+  if command -v copilot-proxy-api >/dev/null 2>&1; then
+    command -v copilot-proxy-api
+    return
+  fi
+
+  local checkout
+  checkout=$(resolve_proxy_checkout)
+  if [[ -n $checkout ]]; then
+    # A built dist runs under plain node; source needs bun. Prefer the build:
+    # it starts faster and does not depend on bun staying installed.
+    if [[ -f "$checkout/dist/main.mjs" ]] && command -v node >/dev/null 2>&1; then
+      echo "$(command -v node) $checkout/dist/main.mjs"
+      return
+    fi
+    local bun_bin
+    bun_bin=$(resolve_bun)
+    if [[ -n $bun_bin && -f "$checkout/src/main.ts" ]]; then
+      echo "$bun_bin run $checkout/src/main.ts"
+      return
+    fi
+  fi
+
+  echo ""
+}
+
+# A source checkout of the proxy, if one is somewhere obvious. Set
+# COPILOT_PROXY_DIR to point at a checkout kept anywhere else; the rest are
+# the conventional spots, tried in order.
+resolve_proxy_checkout() {
+  local candidate
+  for candidate in \
+    "${COPILOT_PROXY_DIR:-}" \
+    "$HOME/code/copilot-proxy-api" \
+    "$HOME/src/copilot-proxy-api" \
+    "$HOME/projects/copilot-proxy-api" \
+    "$HOME/dev/copilot-proxy-api" \
+    "$HOME/repos/copilot-proxy-api"; do
+    [[ -n $candidate ]] || continue
+    if [[ -f "$candidate/package.json" ]] \
+      && grep -q '"name": *"copilot-proxy-api"' "$candidate/package.json" 2>/dev/null; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo ""
+}
+
+# mise installs bun outside the PATH that systemd hands a user unit, so a
+# `command -v` miss is not proof it is absent.
+resolve_bun() {
+  if command -v bun >/dev/null 2>&1; then
+    command -v bun
+    return
+  fi
+  local shim="$HOME/.local/share/mise/installs/bun/latest/bin/bun"
+  [[ -x $shim ]] && echo "$shim" && return
+  echo ""
+}
+
+# ------------------------------------------------------------------- status
+
+# Reports what the panel needs in one payload: is the unit up, is the HTTP
+# server answering, is it signed in, and which clients currently point here.
+# Never fails — an unreachable proxy is a state to draw, not an error.
+cmd_status() {
+  local active="unknown" enabled="unknown"
+  if command -v systemctl >/dev/null 2>&1; then
+    active=$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)
+    enabled=$(systemctl --user is-enabled "$SERVICE" 2>/dev/null || true)
+  fi
+  [[ -n $active ]] || active="unknown"
+  [[ -n $enabled ]] || enabled="unknown"
+
+  local unit_installed=false
+  [[ -f "$UNIT_DIR/$SERVICE.service" ]] && unit_installed=true
+
+  local proxy_bin
+  proxy_bin=$(resolve_proxy_command)
+
+  # A short timeout keeps a hung proxy from freezing the panel's poll.
+  local status_json=""
+  if command -v curl >/dev/null 2>&1; then
+    status_json=$(curl -fsS --max-time 2 "$BASE_URL/status" 2>/dev/null || true)
+  fi
+
+  local reachable=false
+  [[ -n $status_json ]] && reachable=true
+
+  jq -n \
+    --arg service "$SERVICE" \
+    --arg active "$active" \
+    --arg enabled "$enabled" \
+    --arg baseUrl "$BASE_URL" \
+    --argjson port "$PORT" \
+    --argjson unitInstalled "$unit_installed" \
+    --arg proxyBin "$proxy_bin" \
+    --argjson reachable "$reachable" \
+    --argjson status "${status_json:-null}" \
+    --argjson claude "$(claude_state)" \
+    --argjson codex "$(codex_state)" \
+    '{
+      service: $service,
+      active: $active,
+      enabled: $enabled,
+      unitInstalled: $unitInstalled,
+      proxyCommand: $proxyBin,
+      port: $port,
+      baseUrl: $baseUrl,
+      reachable: $reachable,
+      proxy: $status,
+      clients: { claude: $claude, codex: $codex }
+    }'
+}
+
+# Whether Claude Code currently points at this proxy, and at which models.
+claude_state() {
+  if [[ ! -f $CLAUDE_SETTINGS ]]; then
+    jq -n '{configured: false, wired: false, model: null, smallModel: null, effort: null, ultracode: false}'
+    return
+  fi
+  jq --arg base "$BASE_URL" '
+    (.env // {}) as $env
+    | {
+        configured: true,
+        wired: (($env.ANTHROPIC_BASE_URL // "") | rtrimstr("/")) == ($base | rtrimstr("/")),
+        model: $env.ANTHROPIC_MODEL,
+        smallModel: $env.ANTHROPIC_SMALL_FAST_MODEL,
+        effort: .effort,
+        ultracode: (.ultracode == true)
+      }
+  ' "$CLAUDE_SETTINGS" 2>/dev/null \
+    || jq -n '{configured: true, wired: false, model: null, smallModel: null, effort: null, ultracode: false, error: "unreadable settings.json"}'
+}
+
+# Codex config is TOML, so this reads it with grep rather than a parser: the
+# only questions are whether our provider block exists and whether the active
+# model_provider names it.
+codex_state() {
+  if [[ ! -f $CODEX_CONFIG ]]; then
+    jq -n '{configured: false, wired: false, model: null}'
+    return
+  fi
+  local has_provider=false wired=false model="" effort=""
+  grep -q '^\[model_providers\.copilot_proxy\]' "$CODEX_CONFIG" && has_provider=true
+  grep -qE '^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"copilot_proxy"' "$CODEX_CONFIG" && wired=true
+  # First uncommented assignment wins in Codex, and that is the one in effect —
+  # so skip both real comments and the lines we disabled ourselves.
+  local active
+  active=$(grep -vE '^[[:space:]]*#' "$CODEX_CONFIG")
+  model=$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$active" | head -1)
+  effort=$(sed -n 's/^[[:space:]]*model_reasoning_effort[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$active" | head -1)
+  jq -n \
+    --argjson configured "$has_provider" \
+    --argjson wired "$wired" \
+    --arg model "$model" \
+    --arg effort "$effort" \
+    '{
+      configured: $configured,
+      wired: $wired,
+      model: (if $model == "" then null else $model end),
+      reasoningEffort: (if $effort == "" then null else $effort end)
+    }'
+}
+
+# -------------------------------------------------------------- systemd
+
+cmd_install_unit() {
+  need systemctl
+  local proxy_bin
+  proxy_bin=$(resolve_proxy_command)
+  [[ -n $proxy_bin ]] || die "copilot-proxy-api not found. Install it with: npm i -g copilot-proxy-api"
+
+  mkdir -p "$UNIT_DIR"
+  local unit="$UNIT_DIR/$SERVICE.service"
+
+  # Written fresh every time so a changed port or binary path takes effect;
+  # this file is ours, and hand-edits to it are not something to preserve
+  # silently while reporting success.
+  cat >"$unit" <<UNIT
+[Unit]
+Description=GitHub Copilot proxy for Claude Code and Codex CLI
+Documentation=https://github.com/voidsteed/copilot-proxy-api
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$proxy_bin start --port $PORT
+Restart=on-failure
+RestartSec=3
+# A user unit inherits almost no PATH, and the proxy shells out to git and
+# node tooling. Put the usual user bin dirs back so it behaves like a login
+# shell launched it.
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+# The proxy holds a GitHub token; keep it out of the rest of the session.
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
+UNIT
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$SERVICE" >/dev/null 2>&1
+  echo "Installed $unit"
+}
+
+# Starting a proxy that was never authenticated just crash-loops, so the
+# start path says so instead of leaving systemd to retry in the dark.
+cmd_start() {
+  need systemctl
+  [[ -f "$UNIT_DIR/$SERVICE.service" ]] || cmd_install_unit
+  systemctl --user start "$SERVICE"
+}
+
+cmd_stop() { need systemctl; systemctl --user stop "$SERVICE"; }
+cmd_restart() { need systemctl; systemctl --user restart "$SERVICE"; }
+cmd_logs() { need journalctl; journalctl --user -u "$SERVICE" -f -n 100; }
+
+cmd_auth() {
+  local proxy_bin
+  proxy_bin=$(resolve_proxy_command)
+  [[ -n $proxy_bin ]] || die "copilot-proxy-api not found"
+  # Deliberately unquoted: the resolved value can be `bun run /path/main.ts`.
+  # shellcheck disable=SC2086
+  $proxy_bin auth
+}
+
+# ------------------------------------------------------- client wiring
+
+# Claude Code reads env out of settings.json. Merging rather than overwriting
+# keeps permissions, hooks, and everything else the user has configured; only
+# the keys the proxy owns are touched.
+cmd_use_claude() {
+  need jq
+  local primary="${model:-${COPILOT_PROXY_CLAUDE_MODEL:-claude-opus-5}}"
+  local small="${small_model:-${COPILOT_PROXY_CLAUDE_SMALL_MODEL:-claude-sonnet-5}}"
+  local effort="${claude_effort:-${COPILOT_PROXY_CLAUDE_EFFORT:-}}"
+
+  if [[ -n $effort ]]; then
+    case "$effort" in
+      low|medium|high|xhigh|max) ;;
+      *) die "invalid --effort '$effort' (expected low, medium, high, xhigh, or max)" ;;
+    esac
+  fi
+
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+  [[ -f $CLAUDE_SETTINGS ]] || echo '{}' >"$CLAUDE_SETTINGS"
+
+  jq -e . "$CLAUDE_SETTINGS" >/dev/null 2>&1 \
+    || die "$CLAUDE_SETTINGS is not valid JSON; fix or move it first"
+
+  backup_once "$CLAUDE_SETTINGS"
+
+  local tmp
+  tmp=$(mktemp)
+  # `effort` and `ultracode` are top-level settings, not env vars, so they are
+  # applied separately from the proxy block. Passing no value removes the key
+  # rather than writing a sentinel: absent and "default" are the same state to
+  # Claude Code, and leaving a stale pin behind would be a surprise later.
+  jq \
+    --arg base "$BASE_URL/" \
+    --arg model "$primary" \
+    --arg small "$small" \
+    --arg effort "$effort" \
+    --arg ultracode "$ultracode" \
+    '.env = ((.env // {}) + {
+       ANTHROPIC_BASE_URL: $base,
+       ANTHROPIC_AUTH_TOKEN: "dummy",
+       ANTHROPIC_MODEL: $model,
+       ANTHROPIC_DEFAULT_SONNET_MODEL: $model,
+       ANTHROPIC_SMALL_FAST_MODEL: $small,
+       ANTHROPIC_DEFAULT_HAIKU_MODEL: $small,
+       DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1",
+       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+     })
+     | if $effort == "" then del(.effort) else .effort = $effort end
+     | if $ultracode == "" then .
+       elif $ultracode == "true" then .ultracode = true
+       else del(.ultracode) end' "$CLAUDE_SETTINGS" >"$tmp" \
+    || die "failed to update $CLAUDE_SETTINGS"
+  mv "$tmp" "$CLAUDE_SETTINGS"
+  echo "Claude Code now uses $BASE_URL ($primary / $small${effort:+, effort $effort}${ultracode:+, ultracode $ultracode})"
+}
+
+cmd_unset_claude() {
+  need jq
+  [[ -f $CLAUDE_SETTINGS ]] || { echo "Nothing to undo"; return; }
+  backup_once "$CLAUDE_SETTINGS"
+  local tmp
+  tmp=$(mktemp)
+  jq 'if .env then .env |= del(
+        .ANTHROPIC_BASE_URL, .ANTHROPIC_AUTH_TOKEN, .ANTHROPIC_MODEL,
+        .ANTHROPIC_DEFAULT_SONNET_MODEL, .ANTHROPIC_SMALL_FAST_MODEL,
+        .ANTHROPIC_DEFAULT_HAIKU_MODEL, .DISABLE_NON_ESSENTIAL_MODEL_CALLS,
+        .CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+      ) else . end
+      | if (.env | length) == 0 then del(.env) else . end
+      | del(.effort, .ultracode)' \
+    "$CLAUDE_SETTINGS" >"$tmp" || die "failed to update $CLAUDE_SETTINGS"
+  mv "$tmp" "$CLAUDE_SETTINGS"
+  echo "Removed proxy settings from Claude Code"
+}
+
+# Codex config is TOML with no jq equivalent, so the provider block is managed
+# as a delimited region: replace between the markers if they are there, append
+# if they are not. Anything the user wrote outside the markers is left alone.
+CODEX_BEGIN="# >>> omarchy copilot-proxy >>>"
+CODEX_END="# <<< omarchy copilot-proxy <<<"
+# The provider table lives in its own region at the end of the file, since a
+# table header captures every bare key after it — including the user's.
+CODEX_PROVIDER_BEGIN="# >>> omarchy copilot-proxy provider >>>"
+CODEX_PROVIDER_END="# <<< omarchy copilot-proxy provider <<<"
+# Prefix stamped onto model lines this plugin comments out. Machine-readable
+# on purpose: unset-codex strips it to restore the original line verbatim,
+# so turning the proxy off leaves Codex on the model it had before.
+CODEX_DISABLED="#omarchy-copilot-proxy-disabled#"
+
+cmd_use_codex() {
+  local primary="${model:-${COPILOT_PROXY_CODEX_MODEL:-gpt-5.5}}"
+  local effort="${reasoning_effort:-${COPILOT_PROXY_CODEX_EFFORT:-high}}"
+
+  case "$effort" in
+    minimal|low|medium|high|xhigh|max|ultra) ;;
+    *) die "invalid --reasoning-effort '$effort' (expected minimal, low, medium, high, xhigh, max, or ultra)" ;;
+  esac
+
+  mkdir -p "$(dirname "$CODEX_CONFIG")"
+  touch "$CODEX_CONFIG"
+  backup_once "$CODEX_CONFIG"
+
+  # Two regions, not one, because TOML placement rules pull them in opposite
+  # directions. The bare keys must appear before any [table] header or they
+  # become members of it, so they go at the top. The provider table must come
+  # after them for the same reason — a table header ends the top-level scope,
+  # capturing every plain key that follows, including the user's. Putting the
+  # table at the very end leaves the rest of the file structurally untouched.
+  local head_block tail_block
+  head_block=$(cat <<BLOCK
+$CODEX_BEGIN
+model = "$primary"
+model_provider = "copilot_proxy"
+model_reasoning_effort = "$effort"
+$CODEX_END
+BLOCK
+)
+  tail_block=$(cat <<BLOCK
+$CODEX_PROVIDER_BEGIN
+[model_providers.copilot_proxy]
+name = "GitHub Copilot via copilot-proxy-api"
+base_url = "$BASE_URL/v1"
+wire_api = "responses"
+$CODEX_PROVIDER_END
+BLOCK
+)
+
+  local tmp body
+  tmp=$(mktemp)
+  body=$(mktemp)
+
+  # Strip every region this plugin owns, then rebuild around what is left.
+  # Doing it in one direction each time keeps repeated applies idempotent
+  # instead of accreting a new copy per run.
+  #
+  # The separator blank printed before each region is reclaimed with it —
+  # exactly one per region, since any others are the user's own spacing.
+  # Without this, every re-apply would leave one more blank line behind.
+  awk -v begin="$CODEX_BEGIN" -v end="$CODEX_END" \
+      -v pbegin="$CODEX_PROVIDER_BEGIN" -v pend="$CODEX_PROVIDER_END" '
+    function flush(drop) {
+      if (drop > held) drop = held
+      if (started) for (i = 0; i < held - drop; i++) print ""
+      held = 0
+    }
+    $0 == begin || $0 == pbegin { flush(1); skipping = 1; next }
+    $0 == end || $0 == pend { skipping = 0; held = 0; next }
+    skipping { next }
+    $0 == "" { held++; next }
+    { flush(0); started = 1; print }
+    END { flush(0) }
+  ' "$CODEX_CONFIG" >"$body"
+
+  # Whatever the user had that would collide is commented rather than deleted,
+  # tagged so unset-codex can restore it verbatim. A bare `model =` because
+  # the first assignment wins, and any pre-existing copilot_proxy table
+  # because TOML treats a duplicate table as a hard parse error.
+  #
+  # A blank line inside the disabled table gets marked too, not skipped: it is
+  # part of the region the user wrote, and dropping it here would make the
+  # round-trip lossy in a way unset-codex could never undo.
+  awk -v marker="$CODEX_DISABLED" '
+    /^[[:space:]]*\[/ { intable = ($0 ~ /^[[:space:]]*\[model_providers\.copilot_proxy\][[:space:]]*$/) }
+    intable && $0 == "" { intable = 0; print; next }
+    intable { print marker $0; next }
+    /^[[:space:]]*(model|model_provider|model_reasoning_effort)[[:space:]]*=/ { print marker $0; next }
+    { print }
+  ' "$body" > "$body.clean" && mv "$body.clean" "$body"
+
+  {
+    printf '%s\n\n' "$head_block"
+    # The body keeps its own trailing blank lines: they are the user's
+    # formatting, and unset-codex has no way to tell padding we added from
+    # spacing they wrote. Our own separator is the single newline printed
+    # before the table, which the region markers make unambiguous to remove.
+    cat "$body"
+    printf '\n%s\n' "$tail_block"
+  } >"$tmp"
+  rm -f "$body"
+
+  # Last line of defence. A config this script cannot parse is a config Codex
+  # cannot start with, and handing the user a broken file is worse than
+  # refusing to change it — so the result is checked before it replaces the
+  # original, not after.
+  if ! toml_parses "$tmp"; then
+    rm -f "$tmp"
+    die "refusing to write $CODEX_CONFIG: the result would not parse as TOML. Original left untouched."
+  fi
+
+  mv "$tmp" "$CODEX_CONFIG"
+  echo "Codex CLI now uses $BASE_URL/v1 ($primary, effort $effort)"
+}
+
+# True if the file parses as TOML. Silently true when no parser is available:
+# a missing python should not block a config edit, it just costs the check.
+toml_parses() {
+  local file="$1"
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$file" <<'PY' 2>/dev/null
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(0)
+try:
+    with open(sys.argv[1], "rb") as handle:
+        tomllib.load(handle)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+cmd_unset_codex() {
+  [[ -f $CODEX_CONFIG ]] || { echo "Nothing to undo"; return; }
+  grep -qF "$CODEX_BEGIN" "$CODEX_CONFIG" || grep -qF "$CODEX_PROVIDER_BEGIN" "$CODEX_CONFIG" \
+    || { echo "Nothing to undo"; return; }
+  backup_once "$CODEX_CONFIG"
+  local tmp
+  tmp=$(mktemp)
+  # Drop both of our regions and un-comment whatever they displaced, in one
+  # pass. Leaving the original `model` commented would hand Codex a config
+  # with no model at all — worse than the state we found it in.
+  #
+  # Exactly one blank line is reclaimed per region — the separator this
+  # script printed — and any others are the user's own spacing, so they stay.
+  # Blanks are held rather than printed so the decision can be made once the
+  # next line reveals whether a region follows; `started` keeps a leading
+  # blank from surviving a region that was first in the file.
+  awk -v begin="$CODEX_BEGIN" -v end="$CODEX_END" \
+      -v pbegin="$CODEX_PROVIDER_BEGIN" -v pend="$CODEX_PROVIDER_END" \
+      -v marker="$CODEX_DISABLED" '
+    function flush(drop) {
+      if (drop > held) drop = held
+      if (started) for (i = 0; i < held - drop; i++) print ""
+      held = 0
+    }
+    $0 == begin || $0 == pbegin { flush(1); skipping = 1; next }
+    $0 == end || $0 == pend { skipping = 0; held = 0; next }
+    skipping { next }
+    $0 == "" { held++; next }
+    { flush(0); started = 1
+      if (index($0, marker) == 1) print substr($0, length(marker) + 1); else print }
+    END { flush(0) }
+  ' "$CODEX_CONFIG" >"$tmp"
+
+  if ! toml_parses "$tmp"; then
+    rm -f "$tmp"
+    die "refusing to write $CODEX_CONFIG: the result would not parse as TOML. Original left untouched."
+  fi
+
+  mv "$tmp" "$CODEX_CONFIG"
+  echo "Removed proxy provider from Codex config"
+}
+
+# One backup per file, taken before the first edit this plugin ever makes.
+# Re-backing-up on every write would overwrite the pristine copy with an
+# already-modified one, which is exactly what a backup is for avoiding.
+backup_once() {
+  local file="$1"
+  local backup="$file.omarchy-copilot-proxy.bak"
+  [[ -f $backup ]] || cp "$file" "$backup" 2>/dev/null || true
+}
+
+cmd_dashboard() {
+  local url="https://voidsteed.github.io/copilot-proxy-api/dashboard.html?endpoint=$BASE_URL/usage"
+  if command -v omarchy-launch-browser >/dev/null 2>&1; then
+    omarchy-launch-browser "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 &
+  else
+    echo "$url"
+  fi
+}
+
+case "$command_name" in
+  status) need jq; cmd_status ;;
+  install-unit) cmd_install_unit ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  logs) cmd_logs ;;
+  auth) cmd_auth ;;
+  use-claude) cmd_use_claude ;;
+  use-codex) cmd_use_codex ;;
+  unset-claude) cmd_unset_claude ;;
+  unset-codex) cmd_unset_codex ;;
+  dashboard) cmd_dashboard ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command: $command_name" ;;
+esac
