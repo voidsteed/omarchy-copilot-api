@@ -527,12 +527,18 @@ Panel {
                 iconText: "󰗚"
                 bordered: true
                 focusable: true
-                enabled: model.unitInstalled
+                enabled: model.unitInstalled && model.serviceNameValid
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 onClicked: {
-                  if (root.bar) root.bar.run("omarchy-launch-tui journalctl --user -u " + model.service + " -f -n 100")
+                  // The service name is interpolated into a command string
+                  // that reaches a shell, so it is checked rather than
+                  // quoted: a valid systemd unit name contains no shell
+                  // metacharacters, and an invalid one has nothing to show.
+                  if (root.bar && model.serviceNameValid) {
+                    root.bar.run("omarchy-launch-tui journalctl --user -u " + model.service + " -f -n 100")
+                  }
                   root.close()
                 }
               }

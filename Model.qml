@@ -66,6 +66,14 @@ Item {
 
   readonly property int port: Number(setting("port", 4141))
   readonly property string service: String(setting("service", "copilot-proxy-api"))
+
+  // Whether the configured unit name is one systemd would accept. Mirrors
+  // valid_service_name() in the helper. The panel builds a shell command
+  // string around this value for the Logs button, so a name outside the
+  // charset is a reason to disable that button rather than to interpolate
+  // and hope — systemd's charset has no shell metacharacters in it, which is
+  // what makes checking the name sufficient there.
+  readonly property bool serviceNameValid: /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/.test(service)
   readonly property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 300)))
   readonly property string claudeModel: String(setting("claudeModel", "claude-opus-5"))
   readonly property string claudeSmallModel: String(setting("claudeSmallModel", "claude-sonnet-5"))

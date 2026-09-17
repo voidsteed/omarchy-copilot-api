@@ -184,6 +184,15 @@ Everything the panel draws comes from the proxy over HTTP, and some of it ends u
 - **The sign-in URL** is opened only when the whole string is exactly `https://github.com/login/device`, compared case-insensitively. Anything else falls back to that URL, so a `file://` path, a lookalike host, a redirector carrying the real URL in its query string, or a trailing-slash variant is never handed to `xdg-open`.
 - **Effort levels** are closed sets, and **port** and **service name** are range- and charset-checked before either becomes part of a path or a unit file.
 
+### Editing your Codex config
+
+`use-codex` comments out anything in `~/.codex/config.toml` that would collide with the block it writes, and `unset-codex` restores it. Two details worth knowing:
+
+- Each disabled line is stamped with a nonce generated for that edit and recorded in the managed region. `unset-codex` only revives lines carrying the nonce from the region it is removing, so a `#omarchy-copilot-proxy-disabled#` comment you wrote yourself is never uncommented into live configuration.
+- Table scope is tracked properly: a blank line does not end a TOML table, and only top-level `model` keys are displaced, so a `model` inside an unrelated `[profiles.*]` table is left alone.
+
+Both files are backed up to `.omarchy-copilot-proxy.bak` before the first edit, and a result that would not parse as TOML is refused rather than written.
+
 `copilot-proxy-api` is an unofficial, reverse-engineered project that is not affiliated with GitHub. Use it within [GitHub's Acceptable Use Policies](https://docs.github.com/site-policy/acceptable-use-policies/github-acceptable-use-policies) and [Copilot Terms](https://docs.github.com/site-policy/github-terms/github-terms-for-additional-products-and-features#github-copilot).
 
 ## Uninstall

@@ -321,6 +321,17 @@ cmd_install_unit() {
   mkdir -p "$UNIT_DIR"
   local unit="$UNIT_DIR/$SERVICE.service"
 
+  # A newline in the resolved command would not stay inside ExecStart= — it
+  # would start a new unit directive, so `COPILOT_PROXY_COMMAND` could append
+  # ExecStartPost= and run a second program at start. That override already
+  # names an executable, so this is not a privilege boundary; it is that "set
+  # this to your proxy binary" should not also mean "author arbitrary unit
+  # directives", and a value picked up from the environment may not have been
+  # set deliberately.
+  if [[ $proxy_bin == *$'\n'* ]]; then
+    die "refusing to write $unit: the proxy command contains a newline"
+  fi
+
   # Written fresh every time so a changed port or binary path takes effect;
   # this file is ours, and hand-edits to it are not something to preserve
   # silently while reporting success.
@@ -467,7 +478,31 @@ CODEX_PROVIDER_END="# <<< omarchy copilot-proxy provider <<<"
 # Prefix stamped onto model lines this plugin comments out. Machine-readable
 # on purpose: unset-codex strips it to restore the original line verbatim,
 # so turning the proxy off leaves Codex on the model it had before.
-CODEX_DISABLED="#omarchy-copilot-proxy-disabled#"
+#
+# The trailing nonce is what makes the marker a claim about this plugin's own
+# edit rather than a pattern anyone can write. Restoring on the bare prefix
+# meant a comment already in the user's config —
+#
+#   #omarchy-copilot-proxy-disabled#approval_policy = "never"
+#
+# — was uncommented into live configuration by a use/unset round trip, turning
+# something they had deliberately commented out into something Codex obeys.
+# unset-codex only revives lines carrying the nonce written into the region it
+# is removing, so a forged marker is left exactly as it was found.
+CODEX_DISABLED_PREFIX="#omarchy-copilot-proxy-disabled"
+CODEX_DISABLED_TAG="$CODEX_DISABLED_PREFIX-nonce="
+
+# Nonce for this run's disabled lines. Random where a source of randomness
+# exists, timestamped otherwise — it only has to be unguessable-enough to not
+# appear in a config by accident or by hand.
+new_disable_nonce() {
+  local n=""
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    n=$(tr -d '\n-' </proc/sys/kernel/random/uuid 2>/dev/null)
+  fi
+  [[ -n $n ]] || n="$(date +%s)$$"
+  printf '%s' "${n:0:32}"
+}
 
 cmd_use_codex() {
   local primary="${model:-${COPILOT_PROXY_CODEX_MODEL:-gpt-5.5}}"
@@ -494,9 +529,19 @@ cmd_use_codex() {
   # after them for the same reason — a table header ends the top-level scope,
   # capturing every plain key that follows, including the user's. Putting the
   # table at the very end leaves the rest of the file structurally untouched.
+  #
+  # The nonce is recorded in the head region as a comment, so unset-codex can
+  # read back which disabled lines belong to this edit. A previous run's nonce
+  # goes away with the region it was written in, and its disabled lines are
+  # re-stamped below with the current one.
+  local nonce marker
+  nonce=$(new_disable_nonce)
+  marker="$CODEX_DISABLED_TAG$nonce#"
+
   local head_block tail_block
   head_block=$(cat <<BLOCK
 $CODEX_BEGIN
+$CODEX_DISABLED_TAG$nonce
 model = $(toml_string "$primary")
 model_provider = "copilot_proxy"
 model_reasoning_effort = $(toml_string "$effort")
@@ -524,8 +569,14 @@ BLOCK
   # The separator blank printed before each region is reclaimed with it —
   # exactly one per region, since any others are the user's own spacing.
   # Without this, every re-apply would leave one more blank line behind.
+  #
+  # Lines disabled by an earlier run are re-stamped with this run's nonce. The
+  # nonce that authorized them is inside the region being removed, so without
+  # this they would be stranded: still commented, but no longer attributable
+  # to any edit, and unset-codex would correctly refuse to revive them.
   awk -v begin="$CODEX_BEGIN" -v end="$CODEX_END" \
-      -v pbegin="$CODEX_PROVIDER_BEGIN" -v pend="$CODEX_PROVIDER_END" '
+      -v pbegin="$CODEX_PROVIDER_BEGIN" -v pend="$CODEX_PROVIDER_END" \
+      -v oldpfx="$CODEX_DISABLED_TAG" -v marker="$marker" '
     function flush(drop) {
       if (drop > held) drop = held
       if (started) for (i = 0; i < held - drop; i++) print ""
@@ -535,7 +586,17 @@ BLOCK
     $0 == end || $0 == pend { skipping = 0; held = 0; next }
     skipping { next }
     $0 == "" { held++; next }
-    { flush(0); started = 1; print }
+    {
+      flush(0); started = 1
+      # An old stamp is `<tag><nonce>#<original line>`; swap the whole stamp
+      # for the current one rather than parsing the nonce out of it.
+      if (index($0, oldpfx) == 1) {
+        rest = substr($0, length(oldpfx) + 1)
+        hash = index(rest, "#")
+        if (hash > 0) { print marker substr(rest, hash + 1); next }
+      }
+      print
+    }
     END { flush(0) }
   ' "$CODEX_CONFIG" >"$body"
 
@@ -544,14 +605,33 @@ BLOCK
   # the first assignment wins, and any pre-existing copilot_proxy table
   # because TOML treats a duplicate table as a hard parse error.
   #
-  # A blank line inside the disabled table gets marked too, not skipped: it is
-  # part of the region the user wrote, and dropping it here would make the
-  # round-trip lossy in a way unset-codex could never undo.
-  awk -v marker="$CODEX_DISABLED" '
-    /^[[:space:]]*\[/ { intable = ($0 ~ /^[[:space:]]*\[model_providers\.copilot_proxy\][[:space:]]*$/) }
-    intable && $0 == "" { intable = 0; print; next }
+  # Table scope runs from a header to the next header or end of file — blank
+  # lines and comments do not end it. Getting that wrong in either direction
+  # corrupts the file: treating a blank as a boundary leaves the rest of the
+  # user's copilot_proxy table active at top level, and the bare-key rule has
+  # to be confined to top-level scope or it silently strips `model` out of an
+  # unrelated [profiles.*] table that was never in conflict.
+  #
+  # Blank lines inside the disabled table are marked rather than skipped: they
+  # are part of the region the user wrote, and dropping them here would make
+  # the round-trip lossy in a way unset-codex could never undo.
+  awk -v marker="$marker" '
+    # A file starts at top level, before any header has been seen. awk would
+    # otherwise default this to 0 and skip every bare key.
+    BEGIN { toplevel = 1 }
+    # A table header opens a new scope. Only two distinctions matter: are we
+    # inside the copilot_proxy table we have to displace, and are we still at
+    # top level, where a bare key would win over the block we are writing.
+    /^[[:space:]]*\[/ {
+      intable = ($0 ~ /^[[:space:]]*\[model_providers\.copilot_proxy\][[:space:]]*$/)
+      toplevel = 0
+      if (intable) { print marker $0; next }
+      print; next
+    }
     intable { print marker $0; next }
-    /^[[:space:]]*(model|model_provider|model_reasoning_effort)[[:space:]]*=/ { print marker $0; next }
+    toplevel && /^[[:space:]]*(model|model_provider|model_reasoning_effort)[[:space:]]*=/ {
+      print marker $0; next
+    }
     { print }
   ' "$body" > "$body.clean" && mv "$body.clean" "$body"
 
@@ -605,6 +685,16 @@ cmd_unset_codex() {
   backup_once "$CODEX_CONFIG"
   local tmp
   tmp=$(mktemp)
+
+  # Which disabled lines this plugin is entitled to revive. The nonce was
+  # written into the head region by the use-codex run that did the disabling,
+  # so a marker carrying any other nonce — or none — was not written by us and
+  # is left commented exactly as found.
+  local nonce marker=""
+  nonce=$(sed -n "s/^${CODEX_DISABLED_TAG//\//\\/}\([A-Za-z0-9]\{1,32\}\)$/\1/p" \
+    "$CODEX_CONFIG" | head -1)
+  [[ -n $nonce ]] && marker="$CODEX_DISABLED_TAG$nonce#"
+
   # Drop both of our regions and un-comment whatever they displaced, in one
   # pass. Leaving the original `model` commented would hand Codex a config
   # with no model at all — worse than the state we found it in.
@@ -614,9 +704,14 @@ cmd_unset_codex() {
   # Blanks are held rather than printed so the decision can be made once the
   # next line reveals whether a region follows; `started` keeps a leading
   # blank from surviving a region that was first in the file.
+  #
+  # An empty marker means no nonce was found, so nothing is revived: better to
+  # leave a line commented than to activate configuration the user disabled
+  # themselves. `marker != ""` is checked explicitly because index($0, "") is
+  # 1 in awk, which would match every line.
   awk -v begin="$CODEX_BEGIN" -v end="$CODEX_END" \
       -v pbegin="$CODEX_PROVIDER_BEGIN" -v pend="$CODEX_PROVIDER_END" \
-      -v marker="$CODEX_DISABLED" '
+      -v marker="$marker" '
     function flush(drop) {
       if (drop > held) drop = held
       if (started) for (i = 0; i < held - drop; i++) print ""
@@ -627,7 +722,7 @@ cmd_unset_codex() {
     skipping { next }
     $0 == "" { held++; next }
     { flush(0); started = 1
-      if (index($0, marker) == 1) print substr($0, length(marker) + 1); else print }
+      if (marker != "" && index($0, marker) == 1) print substr($0, length(marker) + 1); else print }
     END { flush(0) }
   ' "$CODEX_CONFIG" >"$tmp"
 
