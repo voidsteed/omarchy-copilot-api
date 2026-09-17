@@ -95,17 +95,25 @@ done
 # A model id as Copilot advertises them: `claude-opus-5`, `gpt-5.5`. No
 # quotes, backslashes, whitespace, or newlines, so it cannot close the TOML
 # string it is written into or open a second key after it.
+#
+# LC_ALL=C is not decoration. Under a UTF-8 collation `[A-Za-z]` is a collation
+# range, not an ASCII one, so `é` and `Å` match it and the helper would accept
+# ids the QML mirror rejects. Pinning the locale keeps one grammar rather than
+# one per environment.
 valid_model_id() {
+  local LC_ALL=C
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]]
 }
 
 valid_port() {
+  local LC_ALL=C
   [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
 # Systemd's own unit-name charset, which has no path separator in it — so a
 # service name cannot walk out of $UNIT_DIR when it becomes a filename.
 valid_service_name() {
+  local LC_ALL=C
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]
 }
 

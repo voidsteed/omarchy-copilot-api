@@ -121,29 +121,29 @@ Item {
   /**
    * Whether a URL is GitHub's device-login page and nothing else.
    *
-   * Fails closed: scheme, host, and path all have to match, so a `file://`
+   * Fails closed: the whole string has to be the expected URL, so a `file://`
    * path, a `javascript:` payload, a lookalike host, or a redirector with the
-   * real URL in its query string are all rejected. Matching on the parsed
-   * origin rather than a prefix is deliberate — `https://github.com.evil.tld`
+   * real URL in its query string are all rejected. Matching the parsed
+   * authority rather than a prefix is deliberate — `https://github.com.evil.tld`
    * and `https://evil.tld/?x=https://github.com/login/device` both pass a
-   * `startsWith` check.
+   * `startsWith` check, as does `https://github.com@evil.tld/...`, where the
+   * real host sits after credentials.
+   *
+   * Anchored at both ends, so there is no query string or fragment to carry a
+   * payload and no trailing-slash variant to normalize away. GitHub's device
+   * page needs neither: the code is typed in, not passed in the URL.
    */
   function isDeviceLoginUrl(url) {
-    var text = String(url || "")
-    // Authority must terminate at `/`, `?`, or `#`; credentials (`user@host`)
-    // would move the real host past a check that stopped at the first `/`.
-    var match = /^https:\/\/([^/?#]+)(\/[^?#]*)?/.exec(text)
-    if (!match) return false
-    if (match[1].toLowerCase() !== "github.com") return false
-    var path = String(match[2] || "/").replace(/\/+$/, "")
-    return path === "/login/device"
+    return String(url || "").toLowerCase() === deviceLoginUrl
   }
 
   // The code is drawn into the panel and copied to the clipboard, so it is
-  // held to the shape GitHub actually issues (`ABCD-1234`) rather than
-  // rendered as whatever arrived.
+  // held to the shape GitHub actually issues (`ABCD-1234`). Checked as it
+  // arrived rather than trimmed first: whitespace around it means the value
+  // is not what it claims to be, and quietly cleaning it up would hide that
+  // while still putting the result on the clipboard.
   function sanitizedUserCode(code) {
-    var text = String(code || "").trim()
+    var text = String(code || "")
     return /^[A-Za-z0-9-]{1,32}$/.test(text) ? text : ""
   }
 
@@ -404,9 +404,14 @@ Item {
   }
 
   // Claude Code needs an Anthropic-shaped model; Codex drives the Responses
-  // API, which in practice only the GPT-5 line implements. Copilot advertises
-  // gpt-4o and gpt-3.5-turbo too, but offering them here would be a list of
-  // ways to get a confusing failure rather than a list of choices.
+  // API, which the GPT-5 line and everything after it implements. Copilot
+  // advertises gpt-4o and gpt-3.5-turbo too, but offering them here would be a
+  // list of ways to get a confusing failure rather than a list of choices.
+  //
+  // The cutoff is a major-version floor, not a `gpt-5` prefix: pinning the
+  // literal string meant every model past that line — gpt-6 and later — was
+  // silently missing from the dropdown the day it shipped, including one a
+  // user could already be running.
   function modelSuitable(kind, id) {
     // First gate is shape, not suitability: this list arrives from the proxy
     // and a chosen entry is passed through to the helper, which writes it into
@@ -418,8 +423,25 @@ Item {
     if (id.indexOf("embedding") >= 0) return false
     if (id.indexOf("trajectory-") === 0) return false
     if (kind === "claude") return id.indexOf("claude-") === 0
-    if (kind === "codex") return id.indexOf("gpt-5") === 0
+    if (kind === "codex") return gptMajorVersion(id) >= 5
     return true
+  }
+
+  // Major version of a `gpt-<n>` id, or 0 for anything that is not one.
+  // Matches `gpt-5`, `gpt-5.5`, `gpt-6-astra`, `gpt-10` — and orders them
+  // numerically, so a two-digit major is not mistaken for a smaller one.
+  //
+  // Azure spells the old GPT-3.5 as `gpt-35-turbo`, where `35` is one number
+  // meaning 3.5 rather than a major of thirty-five. That is a closed set of
+  // legacy names, so they are listed rather than inferred from shape — a rule
+  // like "two digits starting 1-4" would also swallow a real future gpt-10.
+  readonly property var dotlessLegacyMajors: ({ "35": true, "45": true })
+
+  function gptMajorVersion(id) {
+    var match = /^gpt-(\d+)(?=$|[.-])/.exec(String(id || ""))
+    if (!match) return 0
+    if (dotlessLegacyMajors[match[1]] === true) return 0
+    return Number(match[1])
   }
 
   // Mirror of valid_model_id() in bin/omarchy-copilot-proxy. Single line, no
