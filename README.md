@@ -176,6 +176,14 @@ The plugin runs unsandboxed inside `omarchy-shell`, with your user's permissions
 
 The `/status` endpoint it polls is deliberately outside the proxy's API-key gate, but exposes no tokens and no model access. Keep the proxy bound to localhost.
 
+### Treating the proxy as untrusted
+
+Everything the panel draws comes from the proxy over HTTP, and some of it ends up in files your agents load or in a URL your browser opens. The proxy is a separate program on a port, so its output is validated rather than trusted:
+
+- **Model ids** must match `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$` — no quotes, backslashes, whitespace, or newlines. They are checked when offered in the dropdown, when stored, before the helper is called, and again inside the helper; values written to `~/.codex/config.toml` are escaped as TOML strings on top of that. Without this, a model id containing a quote could close its TOML string and append configuration of its own — which the parse check afterwards would not catch, since injected TOML parses fine.
+- **The sign-in URL** is opened only if it is exactly GitHub's device-login page (`https://github.com/login/device`), matched on parsed scheme, host, and path. Anything else falls back to the canonical URL, so a `file://` path, a lookalike host, or a redirector carrying the real URL in its query string is never handed to `xdg-open`.
+- **Effort levels** are closed sets, and **port** and **service name** are range- and charset-checked before either becomes part of a path or a unit file.
+
 `copilot-proxy-api` is an unofficial, reverse-engineered project that is not affiliated with GitHub. Use it within [GitHub's Acceptable Use Policies](https://docs.github.com/site-policy/acceptable-use-policies/github-acceptable-use-policies) and [Copilot Terms](https://docs.github.com/site-policy/github-terms/github-terms-for-additional-products-and-features#github-copilot).
 
 ## Uninstall

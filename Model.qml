@@ -104,9 +104,48 @@ Item {
 
   readonly property var authSession: proxyStatus && proxyStatus.auth ? proxyStatus.auth : null
   readonly property string authStatus: authSession ? String(authSession.status || "idle") : "idle"
-  readonly property string userCode: authSession ? String(authSession.userCode || "") : ""
-  readonly property string verificationUri: authSession ? String(authSession.verificationUri || "https://github.com/login/device") : "https://github.com/login/device"
+  readonly property string userCode: authSession ? sanitizedUserCode(authSession.userCode) : ""
+
+  // Where the sign-in button sends the browser. The proxy supplies this, and
+  // the proxy is a separate program listening on a port — so the value is
+  // treated as untrusted input rather than as a fact. Only GitHub's own
+  // device-login page is ever opened; anything else falls back to the
+  // canonical URL instead of being honoured.
+  readonly property string deviceLoginUrl: "https://github.com/login/device"
+  readonly property string verificationUri: {
+    var advertised = authSession ? String(authSession.verificationUri || "") : ""
+    return isDeviceLoginUrl(advertised) ? advertised : deviceLoginUrl
+  }
   readonly property bool authPending: authStatus === "pending"
+
+  /**
+   * Whether a URL is GitHub's device-login page and nothing else.
+   *
+   * Fails closed: scheme, host, and path all have to match, so a `file://`
+   * path, a `javascript:` payload, a lookalike host, or a redirector with the
+   * real URL in its query string are all rejected. Matching on the parsed
+   * origin rather than a prefix is deliberate — `https://github.com.evil.tld`
+   * and `https://evil.tld/?x=https://github.com/login/device` both pass a
+   * `startsWith` check.
+   */
+  function isDeviceLoginUrl(url) {
+    var text = String(url || "")
+    // Authority must terminate at `/`, `?`, or `#`; credentials (`user@host`)
+    // would move the real host past a check that stopped at the first `/`.
+    var match = /^https:\/\/([^/?#]+)(\/[^?#]*)?/.exec(text)
+    if (!match) return false
+    if (match[1].toLowerCase() !== "github.com") return false
+    var path = String(match[2] || "/").replace(/\/+$/, "")
+    return path === "/login/device"
+  }
+
+  // The code is drawn into the panel and copied to the clipboard, so it is
+  // held to the shape GitHub actually issues (`ABCD-1234`) rather than
+  // rendered as whatever arrived.
+  function sanitizedUserCode(code) {
+    var text = String(code || "").trim()
+    return /^[A-Za-z0-9-]{1,32}$/.test(text) ? text : ""
+  }
 
   readonly property var claudeClient: snapshot && snapshot.clients ? snapshot.clients.claude : null
   readonly property var codexClient: snapshot && snapshot.clients ? snapshot.clients.codex : null
@@ -351,7 +390,10 @@ Item {
     }
 
     var current = String(selected || "")
-    if (current !== "" && !seen[current]) {
+    // The kept-but-missing entry still has to be well-formed. It comes from
+    // the persisted setting rather than the live list, which is the one path
+    // into this list that does not already pass modelSuitable().
+    if (current !== "" && !seen[current] && validModelId(current)) {
       options.unshift({
         value: current,
         label: current,
@@ -366,11 +408,25 @@ Item {
   // gpt-4o and gpt-3.5-turbo too, but offering them here would be a list of
   // ways to get a confusing failure rather than a list of choices.
   function modelSuitable(kind, id) {
+    // First gate is shape, not suitability: this list arrives from the proxy
+    // and a chosen entry is passed through to the helper, which writes it into
+    // ~/.codex/config.toml. The helper enforces the same grammar and refuses
+    // anything outside it — filtering here too means a malformed id never
+    // reaches the dropdown to be chosen in the first place, rather than being
+    // offered and then failing at write time.
+    if (!validModelId(id)) return false
     if (id.indexOf("embedding") >= 0) return false
     if (id.indexOf("trajectory-") === 0) return false
     if (kind === "claude") return id.indexOf("claude-") === 0
     if (kind === "codex") return id.indexOf("gpt-5") === 0
     return true
+  }
+
+  // Mirror of valid_model_id() in bin/omarchy-copilot-proxy. Single line, no
+  // quotes and no backslashes, so the value cannot terminate the TOML string
+  // it is written into or open a key of its own after it.
+  function validModelId(id) {
+    return /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/.test(String(id || ""))
   }
 
   function modelFamily(id) {
@@ -414,40 +470,53 @@ Item {
   // Changing a model only means something once it is written to the client's
   // config, so a change to an already-wired client rewires it immediately.
   // Changing one that is off just records the choice for when it is turned on.
+  //
+  // Each setter validates before persisting: a rejected value is never stored,
+  // so a bad id cannot be written once and then replayed out of settings.json
+  // on every later start.
   function setClaudeModel(id) {
-    if (id === root.claudeModel) return
+    if (id === root.claudeModel || !validModelId(id)) return
     persistSetting("claudeModel", id)
     if (root.claudeWired) useClaude()
   }
 
   function setClaudeSmallModel(id) {
-    if (id === root.claudeSmallModel) return
+    if (id === root.claudeSmallModel || !validModelId(id)) return
     persistSetting("claudeSmallModel", id)
     if (root.claudeWired) useClaude()
   }
 
   function setClaudeEffort(level) {
-    if (level === root.claudeEffort) return
+    if (level === root.claudeEffort || !isOption(root.claudeEffortOptions, level)) return
     persistSetting("claudeEffort", level)
     if (root.claudeWired) useClaude()
   }
 
   function setClaudeUltracode(enabled) {
     if (enabled === root.claudeUltracode) return
-    persistSetting("claudeUltracode", enabled)
+    persistSetting("claudeUltracode", enabled === true)
     if (root.claudeWired) useClaude()
   }
 
   function setCodexModel(id) {
-    if (id === root.codexModel) return
+    if (id === root.codexModel || !validModelId(id)) return
     persistSetting("codexModel", id)
     if (root.codexWired) useCodex()
   }
 
   function setCodexReasoningEffort(level) {
-    if (level === root.codexReasoningEffort) return
+    if (level === root.codexReasoningEffort || !isOption(root.codexEffortOptions, level)) return
     persistSetting("codexReasoningEffort", level)
     if (root.codexWired) useCodex()
+  }
+
+  // Effort levels are a closed set the helper also enforces, so membership in
+  // the list the panel offers is the whole check.
+  function isOption(options, value) {
+    for (var i = 0; i < options.length; i++) {
+      if (options[i].value === value) return true
+    }
+    return false
   }
 
   // ------------------------------------------------------------- actions
@@ -500,19 +569,36 @@ Item {
   function installUnit() { runAction(helperArgs("install-unit")) }
   function dashboard() { runAction(helperArgs("dashboard")) }
 
+  // Wiring a client sends the stored model ids to the helper, which writes
+  // them into a config file. The setters already validate, but a settings.json
+  // edited by hand reaches these functions without passing one — so the values
+  // are checked here too, where they actually leave QML. The helper rejects
+  // them a second time; none of the three layers is load-bearing alone.
   function useClaude() {
+    if (!validModelId(root.claudeModel) || !validModelId(root.claudeSmallModel)) {
+      root.lastError = "Refusing to apply an invalid model id"
+      return
+    }
     var argv = helperArgs("use-claude")
       .concat(["--model", root.claudeModel, "--small-model", root.claudeSmallModel])
     // "default" means omit the key, so it is expressed by not passing a flag
     // rather than by writing the word "default" into settings.json.
-    if (root.claudeEffort !== "default") argv = argv.concat(["--effort", root.claudeEffort])
+    if (root.claudeEffort !== "default" && isOption(root.claudeEffortOptions, root.claudeEffort)) {
+      argv = argv.concat(["--effort", root.claudeEffort])
+    }
     if (root.claudeUltracode) argv = argv.concat(["--ultracode"])
     runAction(argv)
   }
 
   function useCodex() {
+    if (!validModelId(root.codexModel)) {
+      root.lastError = "Refusing to apply an invalid model id"
+      return
+    }
+    var effort = isOption(root.codexEffortOptions, root.codexReasoningEffort)
+      ? root.codexReasoningEffort : "high"
     runAction(helperArgs("use-codex")
-      .concat(["--model", root.codexModel, "--reasoning-effort", root.codexReasoningEffort]))
+      .concat(["--model", root.codexModel, "--reasoning-effort", effort]))
   }
 
   function unsetClaude() { runAction(helperArgs("unset-claude")) }
@@ -539,7 +625,12 @@ Item {
 
   function openVerificationPage() {
     if (openProcess.running) return
-    openProcess.command = ["xdg-open", root.verificationUri]
+    // Re-checked here rather than trusted from the property. `verificationUri`
+    // already filters, but this is the line that hands a string to a URL
+    // handler, and that is where the guarantee has to hold — a later edit that
+    // loosens the property should not silently widen what gets opened.
+    var url = isDeviceLoginUrl(root.verificationUri) ? root.verificationUri : root.deviceLoginUrl
+    openProcess.command = ["xdg-open", url]
     openProcess.running = true
   }
 

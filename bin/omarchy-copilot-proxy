@@ -81,6 +81,48 @@ while (($#)); do
   esac
 done
 
+# ------------------------------------------------------------- validation
+#
+# Everything below arrives from outside this script — the panel passes on
+# whatever the proxy's /status advertised, and the environment is whatever the
+# user's shell holds. All of it ends up inside files their agents load, so it
+# is checked against a deliberately narrow grammar before it is written.
+#
+# These refuse rather than sanitize. A real model id, port, or unit name is a
+# short single-line token; anything else is a bug or an attack, and quietly
+# rewriting it into something acceptable would hide both.
+
+# A model id as Copilot advertises them: `claude-opus-5`, `gpt-5.5`. No
+# quotes, backslashes, whitespace, or newlines, so it cannot close the TOML
+# string it is written into or open a second key after it.
+valid_model_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]]
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# Systemd's own unit-name charset, which has no path separator in it — so a
+# service name cannot walk out of $UNIT_DIR when it becomes a filename.
+valid_service_name() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]
+}
+
+# Serialize a value as a TOML basic string, escaping what the spec requires.
+# The grammar above already excludes every one of these characters, so today
+# this is a no-op — it is here so the file stays well-formed on its own terms
+# rather than only because validation happened to run first.
+toml_string() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+valid_port "$PORT" || die "invalid port '$PORT' (expected 1-65535)"
+valid_service_name "$SERVICE" || die "invalid service name '$SERVICE'"
+
 BASE_URL="http://localhost:$PORT"
 
 # How to run the proxy, in order of how specific the answer is: an explicit
@@ -333,6 +375,13 @@ cmd_use_claude() {
   local small="${small_model:-${COPILOT_PROXY_CLAUDE_SMALL_MODEL:-claude-sonnet-5}}"
   local effort="${claude_effort:-${COPILOT_PROXY_CLAUDE_EFFORT:-}}"
 
+  # jq --arg escapes these correctly on its own, so this is not about breaking
+  # out of the JSON. It is that both values name the model every later request
+  # is billed and routed to, and they arrive from the proxy's advertised list
+  # — the same grammar the Codex path enforces applies for the same reason.
+  valid_model_id "$primary" || die "invalid --model '$primary'"
+  valid_model_id "$small" || die "invalid --small-model '$small'"
+
   if [[ -n $effort ]]; then
     case "$effort" in
       low|medium|high|xhigh|max) ;;
@@ -416,6 +465,12 @@ cmd_use_codex() {
   local primary="${model:-${COPILOT_PROXY_CODEX_MODEL:-gpt-5.5}}"
   local effort="${reasoning_effort:-${COPILOT_PROXY_CODEX_EFFORT:-high}}"
 
+  # Checked before anything is written, not after: a model id carrying a quote
+  # or a newline would close the TOML string below and append keys of its own
+  # choosing to the config Codex loads. The parse check at the end of this
+  # function cannot catch that — injected TOML parses fine, that is the point.
+  valid_model_id "$primary" || die "invalid --model '$primary'"
+
   case "$effort" in
     minimal|low|medium|high|xhigh|max|ultra) ;;
     *) die "invalid --reasoning-effort '$effort' (expected minimal, low, medium, high, xhigh, max, or ultra)" ;;
@@ -434,9 +489,9 @@ cmd_use_codex() {
   local head_block tail_block
   head_block=$(cat <<BLOCK
 $CODEX_BEGIN
-model = "$primary"
+model = $(toml_string "$primary")
 model_provider = "copilot_proxy"
-model_reasoning_effort = "$effort"
+model_reasoning_effort = $(toml_string "$effort")
 $CODEX_END
 BLOCK
 )
@@ -444,7 +499,7 @@ BLOCK
 $CODEX_PROVIDER_BEGIN
 [model_providers.copilot_proxy]
 name = "GitHub Copilot via copilot-proxy-api"
-base_url = "$BASE_URL/v1"
+base_url = $(toml_string "$BASE_URL/v1")
 wire_api = "responses"
 $CODEX_PROVIDER_END
 BLOCK
